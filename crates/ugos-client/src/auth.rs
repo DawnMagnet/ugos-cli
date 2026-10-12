@@ -81,7 +81,12 @@ pub async fn fetch_rsa_key(
     let url = format!("{base_url}/v1/verify/check");
     let body = serde_json::json!({"username": username});
 
-    let resp = client.post(&url).json(&body).send().await?;
+    let resp = client
+        .post(&url)
+        .header(CLIENT_ID_HEADER, client_id())
+        .json(&body)
+        .send()
+        .await?;
 
     let header = resp
         .headers()
@@ -130,6 +135,88 @@ pub fn encrypt_password(key: &RsaPublicKey, password: &str) -> Result<String> {
     Ok(B64.encode(ciphertext))
 }
 
+/// Header the web client uses to identify the device; UGOS keys trusted
+/// devices (2FA "trust this device") on it.
+pub const CLIENT_ID_HEADER: &str = "UG-Client-Id";
+
+/// Whether to ask UGOS to trust this device after a 2FA login.
+/// On by default; `UGOS_TRUST=0|false|no` disables it.
+fn trust_enabled() -> bool {
+    !matches!(
+        std::env::var("UGOS_TRUST").map(|v| v.trim().to_ascii_lowercase()),
+        Ok(v) if v == "0" || v == "false" || v == "no"
+    )
+}
+
+/// Stable per-installation device id sent as `UG-Client-Id`.
+///
+/// Taken from `UGOS_CLIENT_ID` when set, otherwise read from (or created
+/// at) `<config dir>/ugos-cli/client-id`. A random id is used for this
+/// process if the file cannot be written.
+pub fn client_id() -> String {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        if let Ok(v) = std::env::var("UGOS_CLIENT_ID") {
+            let v = v.trim().to_owned();
+            if !v.is_empty() {
+                return v;
+            }
+        }
+        let path = dirs::config_dir().map(|d| d.join("ugos-cli").join("client-id"));
+        if let Some(p) = &path
+            && let Ok(v) = std::fs::read_to_string(p)
+        {
+            let v = v.trim().to_owned();
+            if !v.is_empty() {
+                return v;
+            }
+        }
+        let id = random_uuid();
+        if let Some(p) = &path {
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Err(e) = std::fs::write(p, &id) {
+                tracing::warn!("could not persist client id: {e}");
+            }
+        }
+        id
+    })
+    .clone()
+}
+
+/// Random RFC 4122 version-4 UUID string.
+fn random_uuid() -> String {
+    use rsa::rand_core::RngCore as _;
+    let mut b = [0u8; 16];
+    rsa::rand_core::OsRng.fill_bytes(&mut b);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h = b.iter().fold(String::with_capacity(32), |mut acc, x| {
+        use std::fmt::Write as _;
+        let _ = write!(acc, "{x:02x}");
+        acc
+    });
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
+}
+
+#[cfg(test)]
+mod client_id_tests {
+    #[test]
+    fn uuid_shape() {
+        let u = super::random_uuid();
+        assert_eq!(u.len(), 36);
+        assert_eq!(&u[14..15], "4");
+    }
+}
+
 /// Perform the full login flow and return a [`Session`].
 ///
 /// The `client` must have `cookie_store(true)` so cookies are captured
@@ -165,7 +252,12 @@ pub async fn login(
         "is_simple": false,
     });
 
-    let resp = client.post(&url).json(&body).send().await?;
+    let resp = client
+        .post(&url)
+        .header(CLIENT_ID_HEADER, client_id())
+        .json(&body)
+        .send()
+        .await?;
 
     // Check the status code before decoding: a rejected login carries no
     // token, and decoding first would report "missing field `token`" instead
@@ -211,9 +303,17 @@ async fn verify_otp(client: &reqwest::Client, base_url: &str, token_id: &str) ->
         "type": 1,
         "token_id": token_id,
         "trust_info": {"client_type": "web", "system": "ugos-cli", "dev_name": "ugos-cli"},
-        "trust": false,
+        // With `trust: true` UGOS remembers this `UG-Client-Id`, and later
+        // logins from it skip the second factor, like "trust this device"
+        // in the web UI. Set `UGOS_TRUST=0` to opt out.
+        "trust": trust_enabled(),
     });
-    let resp = client.post(&url).json(&body).send().await?;
+    let resp = client
+        .post(&url)
+        .header(CLIENT_ID_HEADER, client_id())
+        .json(&body)
+        .send()
+        .await?;
     let api: crate::types::common::ApiResponse<serde_json::Value> = resp.json().await?;
     Ok(serde_json::from_value(api.into_result()?)?)
 }
