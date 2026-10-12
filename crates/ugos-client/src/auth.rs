@@ -53,7 +53,15 @@ impl std::fmt::Debug for Session {
 /// Login response payload from `/verify/login`.
 #[derive(Debug, Deserialize)]
 struct LoginData {
+    #[serde(default)]
     token: String,
+    /// Set when the account has 2FA enabled; the token is then withheld
+    /// until `/verify/code/login` succeeds.
+    #[serde(default)]
+    enable_otp: bool,
+    /// Handle for the pending 2FA step.
+    #[serde(default)]
+    token_id: String,
     /// Base64-encoded PEM, used for the request encryption scheme.
     #[serde(default)]
     public_key: String,
@@ -149,7 +157,12 @@ pub async fn login(
         "username": creds.username,
         "password": encrypted,
         "keepalive": true,
-        "otp": false,
+        // `otp: true` tells UGOS the client can handle a second factor. The
+        // web desktop always sends it. UGOS 1.20 rejects `otp: false` for
+        // accounts with 2FA enabled with code 9406 ("client is not compatible
+        // with the firmware"), which hides the real reason.
+        "otp": true,
+        "is_simple": false,
     });
 
     let resp = client.post(&url).json(&body).send().await?;
@@ -158,7 +171,16 @@ pub async fn login(
     // token, and decoding first would report "missing field `token`" instead
     // of what actually went wrong.
     let api: crate::types::common::ApiResponse<serde_json::Value> = resp.json().await?;
-    let data: LoginData = serde_json::from_value(api.into_result()?)?;
+    let mut data: LoginData = serde_json::from_value(api.into_result()?)?;
+
+    if data.token.is_empty() && data.enable_otp {
+        data = verify_otp(client, base_url, &data.token_id).await?;
+    }
+    if data.token.is_empty() {
+        return Err(UgosError::Encryption(
+            "login response carried no token".into(),
+        ));
+    }
 
     // The key arrives base64-encoded; decode it here so callers see PEM.
     let public_key = if data.public_key.is_empty() {
@@ -174,4 +196,24 @@ pub async fn login(
         token: data.token,
         public_key,
     })
+}
+
+/// Complete a 2FA login with the authenticator code from `UGOS_OTP`.
+async fn verify_otp(client: &reqwest::Client, base_url: &str, token_id: &str) -> Result<LoginData> {
+    let code = std::env::var("UGOS_OTP")
+        .ok()
+        .map(|c| c.trim().to_owned())
+        .filter(|c| !c.is_empty())
+        .ok_or(UgosError::OtpRequired)?;
+    let url = format!("{base_url}/v1/verify/code/login");
+    let body = serde_json::json!({
+        "code": code,
+        "type": 1,
+        "token_id": token_id,
+        "trust_info": {"client_type": "web", "system": "ugos-cli", "dev_name": "ugos-cli"},
+        "trust": false,
+    });
+    let resp = client.post(&url).json(&body).send().await?;
+    let api: crate::types::common::ApiResponse<serde_json::Value> = resp.json().await?;
+    Ok(serde_json::from_value(api.into_result()?)?)
 }
